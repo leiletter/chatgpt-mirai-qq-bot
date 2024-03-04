@@ -1,16 +1,14 @@
 import json
 import time
-from typing import AsyncGenerator
-
 import aiohttp
 import async_timeout
-
+import tiktoken
 from loguru import logger
+from typing import AsyncGenerator
 
 from adapter.botservice import BotAdapter
 from config import OpenAIAPIKey
 from constants import botManager, config
-import tiktoken
 
 DEFAULT_ENGINE: str = "gpt-3.5-turbo"
 
@@ -53,13 +51,12 @@ class OpenAIChatbot:
             logger.error(f"未知错误: {e}")
             raise
 
-    def add_to_conversation(
-            self,
-            message: str,
-            role: str,
-            session_id: str = "default",
-    ) -> None:
-        self.conversation[session_id].append({"role": role, "content": message})
+    def add_to_conversation(self, message: str, role: str, session_id: str = "default") -> None:
+        if role and message is not None:
+            self.conversation[session_id].append({"role": role, "content": message})
+        else:
+            logger.warning("出现错误！返回消息为空，不添加到会话。")
+            raise ValueError("出现错误！返回消息为空，不添加到会话。")
 
     # https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
     def count_tokens(self, session_id: str = "default", model: str = DEFAULT_ENGINE):
@@ -71,34 +68,17 @@ class OpenAIChatbot:
         except KeyError:
             encoding = tiktoken.get_encoding("cl100k_base")
 
-        if model in {
-            "gpt-3.5-turbo-0613",
-            "gpt-3.5-turbo-16k-0613",
-            "gpt-4-0314",
-            "gpt-4-32k-0314",
-            "gpt-4-0613",
-            "gpt-4-32k-0613",
-            "gpt-3.5-turbo",
-            "gpt-4",
-            "gpt-4-32k"
-        }:
-            tokens_per_message = 3
-            tokens_per_name = 1
-        elif model == "gpt-3.5-turbo-0301":
-            tokens_per_message = 4  # every message follows {role/name}\n{content}\n
-            tokens_per_name = -1  # if there's a name, the role is omitted
-        else:
-            logger.warning("未找到相应模型计算方法，使用默认方法进行计算")
-            tokens_per_message = 3
-            tokens_per_name = 1
+        tokens_per_message = 4
+        tokens_per_name = 1
 
         num_tokens = 0
         for message in self.conversation[session_id]:
             num_tokens += tokens_per_message
             for key, value in message.items():
-                num_tokens += len(encoding.encode(value))
-                if key == "name":
-                    num_tokens += tokens_per_name
+                if value is not None:
+                    num_tokens += len(encoding.encode(value))
+                    if key == "name":
+                        num_tokens += tokens_per_name
         num_tokens += 3  # every reply is primed with assistant
         return num_tokens
 
@@ -165,10 +145,28 @@ class ChatGPTAPIAdapter(BotAdapter):
         self.bot.api_key = self.api_info.api_key
         self.bot.proxy = self.api_info.proxy
         self.bot.conversation[self.session_id] = []
-        self.bot.engine = self.api_info.model
+        self.bot.engine = self.current_model
         self.__conversation_keep_from = 0
 
-    async def request_with_stream(self, session_id: str = None, messages: list = None) -> AsyncGenerator[str, None]:
+    def construct_data(self, messages: list = None, api_key: str = None, stream: bool = True):
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {api_key}'
+        }
+        data = {
+            'model': self.bot.engine,
+            'messages': messages,
+            'stream': stream,
+            'temperature': self.bot.temperature,
+            'top_p': self.bot.top_p,
+            'presence_penalty': self.bot.presence_penalty,
+            'frequency_penalty': self.bot.frequency_penalty,
+            "user": 'user',
+            'max_tokens': self.bot.get_max_tokens(self.session_id, self.bot.engine),
+        }
+        return headers, data
+
+    def _prepare_request(self, session_id: str = None, messages: list = None, stream: bool = False):
         self.api_info = botManager.pick('openai-api')
         api_key = self.api_info.api_key
         proxy = self.api_info.proxy
@@ -177,21 +175,49 @@ class ChatGPTAPIAdapter(BotAdapter):
         if not messages:
             messages = self.bot.conversation[session_id]
 
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {api_key}'
-        }
-        data = {
-            'model': self.bot.engine,
-            'messages': messages,
-            'stream': True,
-            'temperature': self.bot.temperature,
-            'top_p': self.bot.top_p,
-            'presence_penalty': self.bot.presence_penalty,
-            'frequency_penalty': self.bot.frequency_penalty,
-            "user": 'user',
-            'max_tokens': self.bot.get_max_tokens(self.session_id, self.bot.engine),
-        }
+        headers, data = self.construct_data(messages, api_key, stream)
+
+        return proxy, api_endpoint, headers, data
+
+    async def _process_response(self, resp, session_id: str = None):
+
+        result = await resp.json()
+
+        total_tokens = result.get('usage', {}).get('total_tokens', None)
+        logger.debug(f"[ChatGPT-API:{self.bot.engine}] 使用 token 数：{total_tokens}")
+        if total_tokens is None:
+            raise Exception("Response does not contain 'total_tokens'")
+
+        content = result.get('choices', [{}])[0].get('message', {}).get('content', None)
+        logger.debug(f"[ChatGPT-API:{self.bot.engine}] 响应：{content}")
+        if content is None:
+            raise Exception("Response does not contain 'content'")
+
+        response_role = result.get('choices', [{}])[0].get('message', {}).get('role', None)
+        if response_role is None:
+            raise Exception("Response does not contain 'role'")
+
+        self.bot.add_to_conversation(content, response_role, session_id)
+
+        return content
+
+    async def request(self, session_id: str = None, messages: list = None) -> str:
+        proxy, api_endpoint, headers, data = self._prepare_request(session_id, messages, stream=False)
+
+        async with aiohttp.ClientSession() as session:
+            with async_timeout.timeout(self.bot.timeout):
+                async with session.post(f'{api_endpoint}/chat/completions', headers=headers,
+                                                    data=json.dumps(data), proxy=proxy) as resp:
+                    if resp.status != 200:
+                        response_text = await resp.text()
+                        raise Exception(
+                            f"{resp.status} {resp.reason} {response_text}",
+                        )
+                    return await self._process_response(resp, session_id)
+
+    async def request_with_stream(self, session_id: str = None, messages: list = None) -> AsyncGenerator[str, None]:
+        proxy, api_endpoint, headers, data = self._prepare_request(session_id, messages, stream=True)
+
         async with aiohttp.ClientSession() as session:
             with async_timeout.timeout(self.bot.timeout):
                 async with session.post(f'{api_endpoint}/chat/completions', headers=headers, data=json.dumps(data),
@@ -227,12 +253,14 @@ class ChatGPTAPIAdapter(BotAdapter):
                         if 'choices' in event and len(event['choices']) > 0 and 'delta' in event['choices'][0]:
                             delta = event['choices'][0]['delta']
                             if 'role' in delta:
-                                response_role = delta['role']
+                                if delta['role'] is not None:
+                                    response_role = delta['role']
                             if 'content' in delta:
                                 event_text = delta['content']
-                                completion_text += event_text
-                                self.latest_role = response_role
-                                yield completion_text
+                                if event_text is not None:
+                                    completion_text += event_text
+                                    self.latest_role = response_role
+                                    yield event_text
         self.bot.add_to_conversation(completion_text, response_role, session_id)
 
     async def compressed_session(self, session_id: str):
@@ -273,12 +301,18 @@ class ChatGPTAPIAdapter(BotAdapter):
             self.bot.add_to_conversation(prompt, "user", session_id=self.session_id)
             start_time = time.time()
 
-            async for completion_text in self.request_with_stream(session_id=self.session_id):
-                yield completion_text
+            full_response = ''
 
-            token_count = self.bot.count_tokens(self.session_id, self.bot.engine)
-            logger.debug(f"[ChatGPT-API:{self.bot.engine}] 响应：{completion_text}")
-            logger.debug(f"[ChatGPT-API:{self.bot.engine}] 使用 token 数：{token_count}")
+            if config.openai.gpt_params.stream:
+                async for resp in self.request_with_stream(session_id=self.session_id):
+                    full_response += resp
+                    yield full_response
+
+                token_count = self.bot.count_tokens(self.session_id, self.bot.engine)
+                logger.debug(f"[ChatGPT-API:{self.bot.engine}] 响应：{full_response}")
+                logger.debug(f"[ChatGPT-API:{self.bot.engine}] 使用 token 数：{token_count}")
+            else:
+                yield await self.request(session_id=self.session_id)
             event_time = time.time() - start_time
             if event_time is not None:
                 logger.debug(f"[ChatGPT-API:{self.bot.engine}] 接收到全部消息花费了{event_time:.2f}秒")
@@ -286,6 +320,7 @@ class ChatGPTAPIAdapter(BotAdapter):
         except Exception as e:
             logger.error(f"[ChatGPT-API:{self.bot.engine}] 请求失败：\n{e}")
             yield f"发生错误: \n{e}"
+            raise
 
     async def preset_ask(self, role: str, text: str):
         self.bot.engine = self.current_model

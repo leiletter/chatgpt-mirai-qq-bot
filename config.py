@@ -1,11 +1,13 @@
 from __future__ import annotations
-from typing import List, Union, Literal, Dict, Optional
-from pydantic import BaseModel, BaseConfig, Extra
-from charset_normalizer import from_bytes
-from loguru import logger
+
 import os
 import sys
+from typing import List, Union, Literal, Dict, Optional
+
 import toml
+from charset_normalizer import from_bytes
+from loguru import logger
+from pydantic import BaseModel, BaseConfig, Extra
 
 
 class Onebot(BaseModel):
@@ -85,6 +87,7 @@ class OpenAIParams(BaseModel):
     min_tokens: int = 1000
     compressed_session: bool = False
     compressed_tokens: int = 1000
+    stream: bool = True
 
 
 class OpenAIAuths(BaseModel):
@@ -202,7 +205,7 @@ class BingAuths(BaseModel):
     """Bing 的会话创建接入点"""
     accounts: List[BingCookiePath] = []
     """Bing 的账号列表"""
-    max_messages: int = 20
+    max_messages: int = 30
     """Bing 的最大消息数，仅展示用"""
 
 
@@ -258,6 +261,22 @@ class ChatGLMAPI(BaseModel):
 class ChatGLMAuths(BaseModel):
     accounts: List[ChatGLMAPI] = []
     """ChatGLM的账号列表"""
+
+
+class G4fModels(BaseModel):
+    provider: str
+    """ai提供方"""
+    model: str
+    """ai模型"""
+    alias: str
+    """模型缩写"""
+    description: str
+    """介绍"""
+
+
+class G4fAuths(BaseModel):
+    accounts: List[G4fModels] = []
+    """支持的模型"""
 
 
 class SlackAppAccessToken(BaseModel):
@@ -498,6 +517,12 @@ class Ratelimit(BaseModel):
 
 
 class SDWebUI(BaseModel):
+    class ScriptArg(BaseModel):
+        ad_model: str
+
+    class ScriptConfig(BaseModel):
+        args: List['SDWebUI.ScriptArg']
+    
     api_url: str
     """API 基地址，如：http://127.0.0.1:7890"""
     prompt_prefix: str = 'masterpiece, best quality, illustration, extremely detailed 8K wallpaper'
@@ -515,6 +540,7 @@ class SDWebUI(BaseModel):
     cfg_scale: float = 7.5
     restore_faces: bool = False
     authorization: str = ''
+    alwayson_scripts: Dict[str, 'SDWebUI.ScriptConfig'] = {}
     """登录api的账号:密码"""
 
     timeout: float = 10.0
@@ -522,6 +548,8 @@ class SDWebUI(BaseModel):
 
     class Config(BaseConfig):
         extra = Extra.allow
+SDWebUI.update_forward_refs()
+SDWebUI.ScriptConfig.update_forward_refs()
 
 
 class Config(BaseModel):
@@ -543,6 +571,7 @@ class Config(BaseModel):
     poe: PoeAuths = PoeAuths()
     slack: SlackAuths = SlackAuths()
     xinghuo: XinghuoAuths = XinghuoAuths()
+    gpt4free: G4fAuths = G4fAuths()
 
     # === Response Settings ===
     text_to_image: TextToImage = TextToImage()

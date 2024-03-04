@@ -1,6 +1,7 @@
 import os
 import sys
 import creart
+sys.path.append(os.getcwd())
 from asyncio import AbstractEventLoop
 import asyncio
 from utils.exithooks import hook
@@ -8,13 +9,14 @@ from loguru import logger
 from constants import config, botManager
 from utils.edge_tts import load_edge_tts_voices
 
-sys.path.append(os.getcwd())
-
 loop = creart.create(AbstractEventLoop)
 
 loop.run_until_complete(botManager.login())
 
 bots = []
+
+# 将log输出到stdout
+logger.configure(handlers=[{"sink": sys.stdout}])
 
 if config.mirai:
     logger.info("检测到 mirai 配置，将启动 mirai 模式……")

@@ -1,14 +1,15 @@
 import asyncio
+import base64
 import hashlib
 import itertools
+import json
 import os
+import re
+import time
 import urllib.request
 from typing import List, Dict
 from urllib.parse import urlparse
-import re
-import base64
-import json
-import time
+
 import httpx
 import openai
 import regex
@@ -25,9 +26,10 @@ from revChatGPT.typings import Error as V1Error
 from tinydb import TinyDB, Query
 
 import utils.network as network
+from adapter.gpt4free import g4f_helper
 from chatbot.chatgpt import ChatGPTBrowserChatbot
 from config import OpenAIAuthBase, OpenAIAPIKey, Config, BingCookiePath, BardCookiePath, YiyanCookiePath, ChatGLMAPI, \
-    PoeCookieAuth, SlackAppAccessToken, XinghuoCookiePath
+    PoeCookieAuth, SlackAppAccessToken, XinghuoCookiePath, G4fModels
 from exceptions import NoAvailableBotException, APIKeyNoFundsError
 
 
@@ -43,6 +45,7 @@ class BotManager:
         "yiyan-cookie": [],
         "xinghuo-cookie": [],
         "slack-accesstoken": [],
+        "gpt4free": [],
     }
     """Bot list"""
 
@@ -70,6 +73,9 @@ class BotManager:
     xinghuo: List[XinghuoCookiePath]
     """Xinghuo Account Infos"""
 
+    gpt4free: List[G4fModels]
+    """gpt4free Account Infos"""
+
     roundrobin: Dict[str, itertools.cycle] = {}
 
     def __init__(self, config: Config) -> None:
@@ -82,6 +88,8 @@ class BotManager:
         self.chatglm = config.chatglm.accounts if config.chatglm else []
         self.slack = config.slack.accounts if config.slack else []
         self.xinghuo = config.xinghuo.accounts if config.xinghuo else []
+        self.gpt4free = config.gpt4free.accounts if config.gpt4free else []
+
         try:
             os.mkdir('data')
             logger.warning(
@@ -120,14 +128,14 @@ class BotManager:
             openai.api_base = self.config.openai.api_endpoint or openai.api_base
             if openai.api_base.endswith("/"):
                 openai.api_base.removesuffix("/")
+        logger.info(f"当前的 api_endpoint 为：{openai.api_base}")
 
         pattern = r'^https://[^/]+/v1$'
-        if match := re.match(pattern, openai.api_base):
-            logger.info(f"当前的 api_endpoint 为：{openai.api_base}")
-            await self.login_openai()
-        else:
+
+        if not re.match(pattern, openai.api_base):
             logger.error("API反代地址填写错误，正确格式应为 'https://<网址>/v1'")
-            raise ValueError("API反代地址填写错误，正确格式应为 'https://<网址>/v1'")
+
+        await self.login_openai()
 
     async def login(self):
         self.bots = {
@@ -140,6 +148,7 @@ class BotManager:
             "xinghuo-cookie": [],
             "chatglm-api": [],
             "slack-accesstoken": [],
+            "gpt4free": [],
         }
 
         self.__setup_system_proxy()
@@ -152,7 +161,8 @@ class BotManager:
             'xinghuo': self.login_xinghuo,
             'openai': self.handle_openai,
             'yiyan': self.login_yiyan,
-            'chatglm': self.login_chatglm
+            'chatglm': self.login_chatglm,
+            'gpt4free': self.login_gpt4free
         }
 
         for key, login_func in login_funcs.items():
@@ -183,6 +193,7 @@ class BotManager:
                 "yiyan-cookie": "yiyan",
                 "chatglm-api": "chatglm-api",
                 "xinghuo-cookie": "xinghuo",
+                "gpt4free": self.bots["gpt4free"][0].alias if len(self.bots["gpt4free"]) > 0 else "",
             }
 
             self.config.response.default_ai = next(
@@ -332,6 +343,20 @@ class BotManager:
         if len(self.bots) < 1:
             logger.error("所有 ChatGLM 账号均解析失败！")
         logger.success(f"成功解析 {len(self.bots['chatglm-api'])}/{len(self.chatglm)} 个 ChatGLM 账号！")
+
+    def login_gpt4free(self):
+        for i, account in enumerate(self.gpt4free):
+            logger.info("正在解析第 {i} 个 gpt4free 模型", i=i + 1)
+            try:
+                if g4f_helper.g4f_check_account(account):
+                    self.bots["gpt4free"].append(account)
+                    logger.success("解析成功！", i=i + 1)
+            except Exception as e:
+                logger.error("解析失败：")
+                logger.exception(e)
+        if len(self.bots) < 1:
+            logger.error("所有 gpt4free 账号均解析失败！")
+        logger.success(f"成功解析 {len(self.bots['gpt4free'])}/{len(self.gpt4free)} 个 gpt4free 模型！")
 
     async def login_openai(self):  # sourcery skip: raise-specific-error
         counter = 0
@@ -560,14 +585,19 @@ class BotManager:
         if len(self.bots['poe-web']) > 0:
             bot_info += f"* {LlmName.PoeSage.value} : POE Sage 模型\n"
             bot_info += f"* {LlmName.PoeGPT4.value} : POE ChatGPT4 模型\n"
+            bot_info += f"* {LlmName.PoeGPT432k.value} : POE ChatGPT4 32k 模型\n"
             bot_info += f"* {LlmName.PoeClaude.value} : POE Claude 模型\n"
             bot_info += f"* {LlmName.PoeClaude2.value} : POE Claude+ 模型\n"
             bot_info += f"* {LlmName.PoeClaude100k.value} : POE Claude 100k 模型\n"
             bot_info += f"* {LlmName.PoeChatGPT.value} : POE ChatGPT 模型\n"
-            bot_info += f"* {LlmName.PoeDragonfly.value} : POE Dragonfly 模型\n"
-            bot_info += f"* {LlmName.PoeNeevaAI.value} : POE NeevaAI 模型\n"
+            bot_info += f"* {LlmName.PoeChatGPT16k.value} : POE ChatGPT 16k 模型\n"
+            bot_info += f"* {LlmName.PoeLlama2.value} : POE Llama2 模型\n"
+            bot_info += f"* {LlmName.PoePaLM.value} : POE PaLM 模型\n"
         if len(self.bots['slack-accesstoken']) > 0:
             bot_info += f"* {LlmName.SlackClaude.value} : Slack Claude 模型\n"
         if len(self.bots['xinghuo-cookie']) > 0:
             bot_info += f"* {LlmName.XunfeiXinghuo.value} : 星火大模型\n"
+        if len(self.bots['gpt4free']) > 0:
+            for model in self.bots['gpt4free']:
+                bot_info += f"* {model.alias} : {model.description}\n"
         return bot_info
